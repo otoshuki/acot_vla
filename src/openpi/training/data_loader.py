@@ -194,6 +194,7 @@ def create_torch_dataset(
                 for dataset_meta in dataset_metas
                 for key in data_config.action_sequence_keys
             },
+            tolerances_s={r: 0.2 for r in repo_id}
         )
         if data_config.prompt_from_task:
             for n, d in enumerate(dataset._datasets):

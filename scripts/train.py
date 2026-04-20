@@ -2,6 +2,8 @@ import dataclasses
 import functools
 import logging
 import platform
+import signal
+import sys
 from typing import Any
 import os
 import etils.epath as epath
@@ -79,6 +81,140 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     return traverse_util.unflatten_dict(
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
+
+
+# =============================================================================
+# Parameter summary (PyTorch/torchinfo-style table)
+# =============================================================================
+def _path_to_str(path_tuple) -> str:
+    """Join a pytree path tuple into a displayable string. Works with ints
+    (scanned/stacked layers produce integer keys like ('layers', 0, 'kernel')),
+    jax tree DictKey/SequenceKey/GetAttrKey objects, and plain strings."""
+    parts = []
+    for p in path_tuple:
+        # jax.tree_util key types
+        if hasattr(p, "key"):           # DictKey
+            parts.append(str(p.key))
+        elif hasattr(p, "idx"):         # SequenceKey
+            parts.append(str(p.idx))
+        elif hasattr(p, "name"):        # GetAttrKey
+            parts.append(str(p.name))
+        else:
+            parts.append(str(p))
+    return "/".join(parts)
+
+
+def _iter_param_rows(model, trainable_filter):
+    """Yield (path, shape, dtype, n_params, is_trainable) for every nnx.Param in model."""
+    all_state = nnx.state(model, nnx.Param)
+    trainable_state = nnx.state(model, trainable_filter)
+
+    all_pure = all_state.to_pure_dict()
+    trainable_pure = trainable_state.to_pure_dict()
+
+    # Don't pass sep="/" — some path components are ints (scanned layers),
+    # and flax's flatten_dict will try to str-join them and crash. Flatten to
+    # tuple keys and stringify ourselves.
+    all_flat = traverse_util.flatten_dict(all_pure)
+    trainable_flat = traverse_util.flatten_dict(trainable_pure)
+    trainable_paths = {_path_to_str(k) for k in trainable_flat.keys()}
+
+    for path_tuple, arr in all_flat.items():
+        path = _path_to_str(path_tuple)
+        shape = tuple(arr.shape)
+        n = int(np.prod(shape)) if len(shape) > 0 else 1
+        dtype = str(arr.dtype)
+        is_trainable = path in trainable_paths
+        yield path, shape, dtype, n, is_trainable
+
+
+def _dtype_bytes(dtype_str: str) -> int:
+    try:
+        return jnp.dtype(dtype_str).itemsize
+    except Exception:
+        return 4  # fallback
+
+
+def print_parameter_summary(model, trainable_filter, logger=None):
+    """Print a PyTorch-style parameter summary table with trainable/frozen breakdown."""
+    log = logger.info if logger is not None else logging.info
+
+    rows = list(_iter_param_rows(model, trainable_filter))
+
+    total_params = 0
+    trainable_params = 0
+    total_bytes = 0
+    trainable_bytes = 0
+
+    for _, _, dtype, n, tr in rows:
+        nb = n * _dtype_bytes(dtype)
+        total_params += n
+        total_bytes += nb
+        if tr:
+            trainable_params += n
+            trainable_bytes += nb
+    frozen_params = total_params - trainable_params
+    frozen_bytes = total_bytes - trainable_bytes
+
+    # Dynamic column widths, but keep the table readable.
+    name_w = min(max((len(r[0]) for r in rows), default=20), 90)
+    name_w = max(name_w, 40)
+    shape_w = max((len(str(r[1])) for r in rows), default=10)
+    shape_w = max(shape_w, 15)
+    dtype_w = max((len(r[2]) for r in rows), default=7)
+    dtype_w = max(dtype_w, 8)
+
+    header = (
+        f"{'Layer (path)':<{name_w}}  "
+        f"{'Shape':<{shape_w}}  "
+        f"{'Dtype':<{dtype_w}}  "
+        f"{'# Params':>15}  "
+        f"{'Trainable':>10}"
+    )
+    bar = "=" * len(header)
+    dash = "-" * len(header)
+
+    log(bar)
+    log("Parameter Summary".center(len(bar)))
+    log(bar)
+    log(header)
+    log(dash)
+    for path, shape, dtype, n, tr in rows:
+        display_path = path if len(path) <= name_w else ("..." + path[-(name_w - 3):])
+        log(
+            f"{display_path:<{name_w}}  "
+            f"{str(shape):<{shape_w}}  "
+            f"{dtype:<{dtype_w}}  "
+            f"{n:>15,}  "
+            f"{('Yes' if tr else 'No'):>10}"
+        )
+    log(dash)
+
+    def _mb(b):
+        return b / (1024 ** 2)
+
+    if total_params > 0:
+        log(f"Total params:     {total_params:>15,}  ({_mb(total_bytes):>10.2f} MB)")
+        log(
+            f"Trainable params: {trainable_params:>15,}  "
+            f"({_mb(trainable_bytes):>10.2f} MB)  ({100 * trainable_params / total_params:5.2f}%)"
+        )
+        log(
+            f"Frozen params:    {frozen_params:>15,}  "
+            f"({_mb(frozen_bytes):>10.2f} MB)  ({100 * frozen_params / total_params:5.2f}%)"
+        )
+    else:
+        log("No nnx.Param variables found in model.")
+    log(bar)
+
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "frozen_params": frozen_params,
+        "total_bytes": total_bytes,
+        "trainable_bytes": trainable_bytes,
+        "frozen_bytes": frozen_bytes,
+    }
 
 
 @at.typecheck
@@ -205,14 +341,21 @@ def acot_train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
         coarse_actions: _model.CoarseActions
     ):
-        return model.compute_loss(rng, observation, actions, coarse_actions, train=True)
+        out = model.compute_loss(rng, observation, actions, coarse_actions, train=True)
+        # Multi-LoRA returns (loss, stats_dict); plain ACOT returns just a
+        # scalar. Normalise to (loss, dict) so has_aux=True works for both.
+        if isinstance(out, tuple):
+            return out
+        return out, {}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, coarse_actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, coarse_actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions, coarse_actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -244,8 +387,68 @@ def acot_train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **aux,  # router/* diagnostics + loss/flow + loss/aux (empty for plain ACOT)
     }
     return new_state, info
+
+
+# =============================================================================
+# Graceful-shutdown helpers
+# =============================================================================
+class _StopFlag:
+    """Tiny mutable flag for the SIGINT handler to toggle. Using an object (not
+    a bare global) keeps the intent obvious and avoids `global` statements."""
+    def __init__(self):
+        self.requested = False
+        self.hits = 0
+
+
+def _install_sigint_handler(stop_flag: _StopFlag):
+    """Install a SIGINT (Ctrl+C) handler that requests a graceful stop.
+
+    Why a handler instead of `try/except KeyboardInterrupt`:
+      - JAX dispatch is async. An exception fired mid-dispatch can leave the
+        train_state references in an inconsistent / half-donated state.
+      - The data loader has worker processes; an exception from inside
+        `next(data_iter)` can be noisy and leaves checkpoint saving to luck.
+      - With a flag, we always finish the current step, THEN save cleanly.
+
+    Second Ctrl+C -> hard exit (escape hatch if saving itself hangs).
+    """
+    def handler(signum, frame):
+        stop_flag.hits += 1
+        if stop_flag.hits >= 2:
+            logging.error("Second interrupt received — force exiting without saving.")
+            # 128 + SIGINT(2) is the conventional exit code.
+            os._exit(130)
+        stop_flag.requested = True
+        logging.warning(
+            "Interrupt received — will save an emergency checkpoint after the "
+            "current step finishes. Press Ctrl+C again to force-exit."
+        )
+
+    signal.signal(signal.SIGINT, handler)
+
+
+def _emergency_save(checkpoint_manager, train_state, data_loader, step: int):
+    """Block on pending JAX work, then persist state + wait for orbax to flush."""
+    logging.warning("=" * 70)
+    logging.warning(f"Saving emergency checkpoint at step {step} ...")
+    logging.warning("=" * 70)
+    try:
+        # Make sure the train_state arrays are fully materialized before orbax
+        # tries to serialize them — otherwise async dispatch can race the save.
+        jax.block_until_ready(train_state)
+        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        checkpoint_manager.wait_until_finished()
+        logging.info(f"Emergency checkpoint saved successfully at step {step}.")
+        return True
+    except Exception as e:
+        # Orbax may refuse if `step` collides with an in-flight async save or
+        # violates its save policy. Log loudly so the user knows.
+        logging.error(f"Emergency checkpoint save FAILED: {e!r}")
+        return False
+
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -314,10 +517,30 @@ def main(config: _config.TrainConfig):
         )
 
     start_step = int(train_state.step)
-    print("\n--- Trainable Parameters ---")
-    model = nnx.merge(train_state.model_def, train_state.params)
-    trainable_state = nnx.state(model, config.trainable_filter)
-    logging.info(f"{training_utils.array_tree_to_info(trainable_state)}")
+
+    # ------------------------------------------------------------------
+    # PyTorch-style parameter summary (trainable + frozen breakdown).
+    # ------------------------------------------------------------------
+    model_for_summary = nnx.merge(train_state.model_def, train_state.params)
+    summary_stats = print_parameter_summary(model_for_summary, config.trainable_filter)
+    # Also push the headline numbers to wandb so they show up in the run overview.
+    try:
+        wandb.summary["params/total"] = summary_stats["total_params"]
+        wandb.summary["params/trainable"] = summary_stats["trainable_params"]
+        wandb.summary["params/frozen"] = summary_stats["frozen_params"]
+        wandb.summary["params/total_MB"] = summary_stats["total_bytes"] / (1024 ** 2)
+        wandb.summary["params/trainable_MB"] = summary_stats["trainable_bytes"] / (1024 ** 2)
+    except Exception as e:
+        logging.warning(f"Could not write param summary to wandb: {e!r}")
+    # Free the temporary merged model so we don't keep extra references alive.
+    del model_for_summary
+
+    # ------------------------------------------------------------------
+    # Install SIGINT (Ctrl+C) handler for graceful emergency-save.
+    # ------------------------------------------------------------------
+    stop_flag = _StopFlag()
+    _install_sigint_handler(stop_flag)
+
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -326,24 +549,72 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+    last_completed_step = start_step
+    try:
+        for step in pbar:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            infos.append(info)
+            last_completed_step = int(train_state.step)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                infos = []
+            batch = next(data_iter)
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+            # Graceful shutdown check — runs AFTER the step fully completes.
+            if stop_flag.requested:
+                pbar.close()
+                saved = _emergency_save(
+                    checkpoint_manager, train_state, data_loader, last_completed_step
+                )
+                logging.info(
+                    f"Exiting after Ctrl+C. Last completed step: {last_completed_step}. "
+                    f"Emergency save: {'OK' if saved else 'FAILED'}."
+                )
+                # Clean up data loader workers if the loader exposes a shutdown hook.
+                _shutdown_data_loader(data_loader)
+                # Exit with conventional SIGINT code.
+                sys.exit(0 if saved else 130)
+
+    except KeyboardInterrupt:
+        # Belt-and-suspenders: if the signal handler somehow didn't catch it
+        # (e.g., raised between the flag check and the next step), still save.
+        pbar.close()
+        logging.warning("KeyboardInterrupt reached the training loop — saving checkpoint.")
+        saved = _emergency_save(
+            checkpoint_manager, train_state, data_loader, last_completed_step
+        )
+        _shutdown_data_loader(data_loader)
+        sys.exit(0 if saved else 130)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    _shutdown_data_loader(data_loader)
+
+
+def _shutdown_data_loader(data_loader):
+    """Best-effort cleanup of data-loader worker processes.
+
+    Different data-loader backends (PyTorch, grain, custom) expose different
+    shutdown hooks. We probe for the common ones and stay silent if none match.
+    """
+    for attr in ("shutdown", "close", "_shutdown_workers"):
+        fn = getattr(data_loader, attr, None)
+        if callable(fn):
+            try:
+                fn()
+                logging.info(f"Data loader {attr}() called successfully.")
+                return
+            except Exception as e:
+                logging.warning(f"Data loader {attr}() raised {e!r}; continuing.")
 
 
 if __name__ == "__main__":

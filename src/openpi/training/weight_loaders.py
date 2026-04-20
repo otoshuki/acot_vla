@@ -77,7 +77,36 @@ class ACOTCheckpointWeightLoader(WeightLoader):
                 target_key = key_mapping[source_key]
                 loaded_params[target_key] = loaded_params[source_key]
                 print(f"[INFO] Re-mapped pretrained weight '{source_key}' -> '{target_key}' (for Reasoner)")
-                
+
+        # --- BEGIN FIX: normalize list-index keys to integers ---------------
+        # Orbax saves Python lists as dicts with stringified integer keys
+        # ("0", "1", ...), while nnx.state() flattens Python lists using actual
+        # integer indices. That mismatch makes `flat_loaded` keys like
+        #   ('implicit_action_reasoner', 'q_proj', '0', 'kernel')
+        # never match `flat_ref` keys like
+        #   ('implicit_action_reasoner', 'q_proj',  0 , 'kernel').
+        # Result: every list-indexed submodule silently loads as random.
+        # We recursively rewrite stringified-int dict keys back to ints before
+        # handoff to _merge_params so the tuple-key comparison succeeds.
+        def _normalize_list_indices(obj):
+            if isinstance(obj, dict):
+                # If ALL keys in this dict look like non-negative integer
+                # strings, treat it as a serialized list and convert keys
+                # to ints. Otherwise leave keys as-is.
+                keys = list(obj.keys())
+                all_intlike = len(keys) > 0 and all(
+                    isinstance(k, str) and k.isdigit() for k in keys
+                )
+                out = {}
+                for k, v in obj.items():
+                    new_k = int(k) if all_intlike else k
+                    out[new_k] = _normalize_list_indices(v)
+                return out
+            return obj
+
+        loaded_params = _normalize_list_indices(loaded_params)
+        # --- END FIX --------------------------------------------------------
+
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 @dataclasses.dataclass(frozen=True)

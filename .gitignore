@@ -3,6 +3,12 @@ assets/
 checkpoints/
 data/
 wandb/
+AgiBotWorld/
+gitignore_visible
+dockerignore_visible
+
+# Tar files
+*.tar
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

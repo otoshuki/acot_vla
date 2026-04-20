@@ -21,7 +21,9 @@ class EnvMode(enum.Enum):
     VLABENCH = "vlabench"
     LIBEROPLUS = "liberoplus"
     G2SIM = "g2sim"
-
+    G2SIM_BASE = "g2sim_base"
+    #MOERA
+    G2SIM_MOERA = "g2sim_moera"
 
 @dataclasses.dataclass
 class Checkpoint:
@@ -86,10 +88,17 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.G2SIM: Checkpoint(
         config="acot_icra_simulation_challenge_reasoning_to_action",
-        dir="./checkpoints/acot_icra_simulation_challenge_reasoning_to_action/exp_name/30000",
-    )
+        dir="./checkpoints/ace_v1/12000",
+    ),
+    EnvMode.G2SIM_BASE: Checkpoint(
+        config="pi05_g2sim_base",
+        dir="gs://openpi-assets/checkpoints/pi05_base",
+    ),
+    EnvMode.G2SIM_MOERA: Checkpoint(
+        config="teamace_mora",
+        dir="./checkpoints/teamace_mora/mk7/10000",
+    ),
 }
-
 
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
